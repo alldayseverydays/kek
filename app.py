@@ -681,8 +681,14 @@ def health():
     return jsonify({"status": "alive"}), 200
 
 
+LOGIN_BUTTON = "🔐 Войти"
+LOGOUT_BUTTON = "🚪 Выйти"
+LOGIN_KEYBOARD = {"keyboard": [[{"text": LOGIN_BUTTON}]], "resize_keyboard": True}
 PRIVATE_KEYBOARD = {
-    "keyboard": [[{"text": "Личный кабинет"}, {"text": "Меню"}], [{"text": "Мои заявки"}]],
+    "keyboard": [
+        [{"text": "Личный кабинет"}, {"text": "Меню"}],
+        [{"text": "Мои заявки"}, {"text": LOGOUT_BUTTON}],
+    ],
     "resize_keyboard": True,
 }
 
@@ -726,17 +732,18 @@ def handle_private_message(message: dict) -> None:
         telegram_id, {"awaiting_password": False, "authenticated": False, "attempts": 0}
     )
 
-    if command == "/logout":
+    login_requested = command in (LOGIN_BUTTON, "/login")
+    if command in (LOGOUT_BUTTON, "/logout"):
         state.update(authenticated=False, awaiting_password=False)
         tg_call("sendMessage", {
             "chat_id": telegram_id,
             "text": "Вы вышли из личного кабинета.",
-            "reply_markup": {"remove_keyboard": True},
+            "reply_markup": LOGIN_KEYBOARD,
         })
         return
 
     if not state["authenticated"]:
-        if state["awaiting_password"] and command and command not in ("/start", "/login"):
+        if state["awaiting_password"] and command and not login_requested and command != "/start":
             if message.get("message_id"):
                 tg_call("deleteMessage", {"chat_id": telegram_id, "message_id": message["message_id"]})
 
@@ -762,8 +769,19 @@ def handle_private_message(message: dict) -> None:
             })
             return
 
-        state["awaiting_password"] = True
-        tg_call("sendMessage", {"chat_id": telegram_id, "text": "🔐 Введите пароль для входа в личный кабинет:"})
+        if login_requested or state["awaiting_password"]:
+            state["awaiting_password"] = True
+            tg_call("sendMessage", {
+                "chat_id": telegram_id,
+                "text": "🔐 Введите пароль для входа в личный кабинет:",
+                "reply_markup": {"remove_keyboard": True},
+            })
+        else:
+            tg_call("sendMessage", {
+                "chat_id": telegram_id,
+                "text": "Нажми «Войти», чтобы открыть личный кабинет.",
+                "reply_markup": LOGIN_KEYBOARD,
+            })
         return
 
     if command == "/agents":
@@ -786,12 +804,12 @@ def handle_private_message(message: dict) -> None:
         _stats_executor.submit(send_private_stats, telegram_id, user, show_tickets)
         return
 
-    if command not in ("Меню", "/menu", "/start", "/login"):
+    if command not in ("Меню", "/menu", "/start") and not login_requested:
         return
 
     tg_call("sendMessage", {
         "chat_id": telegram_id,
-        "text": "Личный кабинет — статистика\nМои заявки — список назначенных заявок\n/agents — список агентов UseDesk\n/logout — выйти",
+        "text": "Личный кабинет — статистика\nМои заявки — список назначенных заявок\n/agents — список агентов UseDesk",
         "reply_markup": PRIVATE_KEYBOARD,
     })
 
