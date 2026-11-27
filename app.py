@@ -31,6 +31,7 @@ BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET)
 ADMIN_USERS = json.loads(os.getenv("ADMIN_USERS", "[]"))
 ADMIN_BY_ID = {int(u["telegram_id"]): u for u in ADMIN_USERS}
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 MAX_LOGIN_ATTEMPTS = 5
 
 STATUS_NAMES = {1: "Открыт", 2: "На паузе", 3: "Решён", 4: "Спам"}
@@ -76,7 +77,7 @@ def verify_admin_password(password: str, user: dict) -> bool:
     stored_hash = user.get("password_hash")
     if stored_hash:
         return verify_password(password, stored_hash)
-    configured_password = user.get("password")
+    configured_password = user.get("password", ADMIN_PASSWORD)
     return (
         isinstance(configured_password, str)
         and bool(configured_password.strip())
