@@ -72,6 +72,18 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(dk.hex(), hash_hex)
 
 
+def verify_admin_password(password: str, user: dict) -> bool:
+    stored_hash = user.get("password_hash")
+    if stored_hash:
+        return verify_password(password, stored_hash)
+    configured_password = user.get("password")
+    return (
+        isinstance(configured_password, str)
+        and bool(configured_password.strip())
+        and hmac.compare_digest(password.encode(), configured_password.encode())
+    )
+
+
 def http_session() -> requests.Session:
     if not hasattr(_http, "session"):
         _http.session = requests.Session()
@@ -644,7 +656,7 @@ def handle_private_message(message: dict) -> None:
                 tg_call("deleteMessage", {"chat_id": telegram_id, "message_id": message["message_id"]})
 
             if state["attempts"] < MAX_LOGIN_ATTEMPTS:
-                if verify_password(text, user.get("password_hash", "")):
+                if verify_admin_password(text, user):
                     state.update(authenticated=True, awaiting_password=False, attempts=0)
                     tg_call("sendMessage", {
                         "chat_id": telegram_id,
