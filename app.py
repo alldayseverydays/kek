@@ -6,9 +6,10 @@ import os
 import re
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html import escape
-from threading import Condition, local
+from threading import Condition, Lock, local
 from zoneinfo import ZoneInfo
 
 import requests
@@ -34,7 +35,15 @@ ADMIN_BY_ID = {int(u["telegram_id"]): u for u in ADMIN_USERS}
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 MAX_LOGIN_ATTEMPTS = 5
 
-STATUS_NAMES = {1: "Открыт", 2: "На паузе", 3: "Решён", 4: "Спам"}
+STATUS_NAMES = {1: "Открыт", 2: "Выполнен", 3: "Закрыт", 4: "Удалён", 5: "На удержании", 7: "Спам"}
+ACTIVE_TICKET_STATUSES = "1,5,6,8"
+TICKET_ACTION_STATUSES = {"pause": 5, "resolve": 2}
+TICKET_STATUS_HEADINGS = {
+    1: "🟢 <b>Заявка открыта</b>",
+    2: "✅ <b>Заявка решена</b>",
+    3: "✅ <b>Заявка закрыта</b>",
+    5: "⏸ <b>Заявка на паузе</b>",
+}
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 AGENTS_CACHE_TTL = 300
 PROCESSED_IDS_LIMIT = 2000
@@ -55,6 +64,22 @@ _sent_notifications: dict = {}
 _processed_comment_ids: set = set()
 _notified_tickets: set = set()
 _auth_state: dict = {}
+_private_updates = OrderedDict()
+_private_updates_lock = Lock()
+_stats_executor = ThreadPoolExecutor(max_workers=2)
+_stats_in_progress = set()
+
+
+def is_duplicate_private_update(update_id) -> bool:
+    if not isinstance(update_id, int):
+        return False
+    with _private_updates_lock:
+        if update_id in _private_updates:
+            return True
+        _private_updates[update_id] = None
+        if len(_private_updates) > PROCESSED_IDS_LIMIT:
+            _private_updates.popitem(last=False)
+        return False
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -201,13 +226,35 @@ def get_ticket_count(filters: dict) -> int:
 
 
 def get_active_ticket_count(agent_usedesk_id=None) -> int:
-    total = 0
-    for status_id in (1, 2):
-        filters = {"fstatus": status_id}
-        if agent_usedesk_id:
-            filters["fassigned"] = [{"assignee_id": int(agent_usedesk_id)}]
-        total += get_ticket_count(filters)
-    return total
+    filters = {"fstatus": ACTIVE_TICKET_STATUSES}
+    if agent_usedesk_id:
+        filters["fassigned"] = [{"assignee_id": int(agent_usedesk_id)}]
+    return get_ticket_count(filters)
+
+
+def format_my_tickets(user: dict) -> str:
+    agent_id = user.get("usedesk_agent_id")
+    if not agent_id:
+        return "Укажи usedesk_agent_id в ADMIN_USERS. Узнать свой ID в UseDesk можно командой /agents."
+    tickets = usedesk_api_call("tickets", {
+        "fstatus": ACTIVE_TICKET_STATUSES,
+        "fassigned": [{"assignee_id": int(agent_id)}],
+        "offset": 0,
+    })
+    if not isinstance(tickets, list):
+        return "Не удалось загрузить заявки из UseDesk."
+    if not tickets:
+        return "У тебя нет активных заявок."
+
+    lines = ["📋 <b>Мои заявки</b>"]
+    for ticket in tickets[:20]:
+        ticket_id = escape(str(ticket["id"]))
+        subject = escape((ticket.get("subject") or "Без темы")[:100])
+        url = build_ticket_url(ticket["id"]) or f"https://secure.usedesk.ru/tickets/{ticket_id}"
+        lines.append(f'<a href="{escape(url)}">№ {ticket_id}</a> · {subject}')
+    if len(tickets) > 20:
+        lines.append("Показаны первые 20 заявок.")
+    return "\n".join(lines)
 
 
 def format_stats_message(user: dict) -> str:
@@ -223,9 +270,13 @@ def format_stats_message(user: dict) -> str:
     return "\n".join(lines)
 
 
+def update_ticket(ticket_id, **fields) -> bool:
+    data = usedesk_api_call("update/ticket", {"ticket_id": str(ticket_id), **fields})
+    return isinstance(data, dict) and data.get("status") == "success"
+
+
 def assign_ticket(ticket_id, agent_id) -> bool:
-    data = usedesk_api_call("update/ticket", {"ticket_id": str(ticket_id), "assignee_id": str(agent_id)})
-    return bool(data) and data.get("status") == "success"
+    return update_ticket(ticket_id, assignee_id=str(agent_id))
 
 
 def extract_ticket_info(payload: dict) -> dict:
@@ -323,13 +374,13 @@ def format_comment_message(info: dict) -> str:
 def build_caption(info: dict) -> str:
     header_text = "\n".join(build_header_lines(info) + [""])
     message = info["message"].strip()
-    max_len = max(0, 1024 - len(header_text) - 1)
+    max_len = max(0, 1024 - len(header_text) - 128)
     if len(message) > max_len:
         message = message[:max_len].rstrip() + "…"
     return header_text + (message or "(пустое сообщение)")
 
 
-def register_sent_notification(ticket_id, chat_id, message_id, kind: str, base_text: str) -> None:
+def register_sent_notification(ticket_id, chat_id, message_id, kind: str, base_text: str, *, has_keyboard=True) -> None:
     if not ticket_id or ticket_id == "—" or not message_id:
         return
     _sent_notifications[str(ticket_id)] = {
@@ -338,6 +389,7 @@ def register_sent_notification(ticket_id, chat_id, message_id, kind: str, base_t
         "kind": kind,
         "base_text": base_text,
         "assignee_id": None,
+        "has_keyboard": has_keyboard,
     }
 
 
@@ -357,7 +409,7 @@ def sync_ticket_assignee(ticket_id, assignee_id) -> None:
 
 
 def insert_agent_line(base_text: str, agent_name: str) -> str:
-    agent_line = f"🧑‍💼 <b>Агент:</b> {escape(agent_name)}"
+    agent_line = f"🧑‍💼 <b>Агент:</b> {escape(agent_name[:80])}"
     lines = base_text.split("\n")
     insert_at = len(lines)
     for i, line in enumerate(lines):
@@ -377,7 +429,12 @@ def edit_sent_notification(ticket_id, new_text: str) -> bool:
         return False
     method = "editMessageText" if sent["kind"] == "text" else "editMessageCaption"
     field = "text" if sent["kind"] == "text" else "caption"
-    result = tg_call(method, {"chat_id": sent["chat_id"], "message_id": sent["message_id"], field: new_text, "parse_mode": "HTML"})
+    payload = {"chat_id": sent["chat_id"], "message_id": sent["message_id"], field: new_text, "parse_mode": "HTML"}
+    if sent["has_keyboard"]:
+        keyboard = build_action_keyboard(ticket_id)
+        if keyboard:
+            payload["reply_markup"] = keyboard
+    result = tg_call(method, payload)
     if not result or not result.get("ok"):
         logger.error("Не удалось отредактировать сообщение о заявке %s: %s", ticket_id, result)
         return False
@@ -393,15 +450,14 @@ def update_notification_with_agent(ticket_id, agent_name: str) -> None:
     edit_sent_notification(ticket_id, insert_agent_line(sent["base_text"], agent_name))
 
 
-def mark_notification_resolved(ticket_id) -> None:
+def sync_ticket_status(ticket_id, status_id) -> None:
     sent = _sent_notifications.get(str(ticket_id))
-    if not sent or sent.get("resolved"):
+    heading = TICKET_STATUS_HEADINGS.get(int(status_id)) if str(status_id).isdigit() else None
+    if not sent or heading is None:
         return
-    lines = sent["base_text"].split("\n")
-    if lines and lines[0].startswith("🆕"):
-        lines[0] = "✅ <b>Заявка решена</b>"
-    if edit_sent_notification(ticket_id, "\n".join(lines)):
-        sent["resolved"] = True
+    current_heading, _, body = sent["base_text"].partition("\n")
+    if heading != current_heading:
+        edit_sent_notification(ticket_id, f"{heading}\n{body}")
 
 
 def build_ticket_url(ticket_id) -> str | None:
@@ -419,6 +475,11 @@ def build_action_keyboard(ticket_id) -> dict | None:
         rows.append([{"text": "🔗 Открыть заявку", "url": ticket_url}])
     if USEDESK_API_TOKEN:
         rows.append([{"text": "👤 Назначить", "callback_data": f"assign:{ticket_id}"}])
+        rows[-1].append({"text": "🙋 Взять себе", "callback_data": f"take:{ticket_id}"})
+        rows.append([
+            {"text": "⏸ На паузу", "callback_data": f"pause:{ticket_id}"},
+            {"text": "✅ Решить", "callback_data": f"resolve:{ticket_id}"},
+        ])
     return {"inline_keyboard": rows} if rows else None
 
 
@@ -498,7 +559,9 @@ def send_telegram_media_group(files: list, caption: str, ticket_id=None) -> bool
 
     sent_messages = result.get("result", [])
     if sent_messages:
-        register_sent_notification(ticket_id, TELEGRAM_CHAT_ID, sent_messages[0].get("message_id"), "caption", caption)
+        register_sent_notification(
+            ticket_id, TELEGRAM_CHAT_ID, sent_messages[0].get("message_id"), "caption", caption, has_keyboard=False
+        )
 
     keyboard = build_action_keyboard(ticket_id)
     if keyboard:
@@ -548,14 +611,14 @@ def handle_trigger_event(payload: dict) -> None:
         notify_new_client_message(ticket_id, payload.get("client") or {})
         return
 
-    if ticket_id in _notified_tickets:
+    if str(ticket_id) in _sent_notifications:
         for change in changes:
             if not isinstance(change, dict):
                 continue
             if change.get("target") == "assignee_id":
                 sync_ticket_assignee(ticket_id, change.get("value"))
-            elif change.get("target") == "status_id" and str(change.get("value")) == "3":
-                mark_notification_resolved(ticket_id)
+            elif change.get("target") in ("status", "status_id"):
+                sync_ticket_status(ticket_id, change.get("value"))
 
 
 @app.route("/usedesk-webhook", methods=["POST"])
@@ -576,10 +639,9 @@ def usedesk_webhook():
     if "comment" not in payload:
         info = extract_ticket_info(payload)
         ticket_data = payload.get("ticket", {})
-        if info["id"] in _notified_tickets:
+        if str(info["id"]) in _sent_notifications:
             sync_ticket_assignee(info["id"], ticket_data.get("assignee_id"))
-            if ticket_data.get("status_id") == 3:
-                mark_notification_resolved(info["id"])
+            sync_ticket_status(info["id"], ticket_data.get("status_id"))
         return jsonify({"status": "cached"}), 200
 
     comment = payload["comment"]
@@ -620,9 +682,31 @@ def health():
 
 
 PRIVATE_KEYBOARD = {
-    "keyboard": [[{"text": "Личный кабинет"}, {"text": "Меню"}]],
+    "keyboard": [[{"text": "Личный кабинет"}, {"text": "Меню"}], [{"text": "Мои заявки"}]],
     "resize_keyboard": True,
 }
+
+
+def send_private_stats(telegram_id, user: dict, show_tickets: bool) -> None:
+    try:
+        body = (
+            format_my_tickets(user) if show_tickets
+            else f"👤 <b>{escape(user['name'])}</b>\n\n{format_stats_message(user)}"
+        )
+    except Exception:
+        logger.exception("Не удалось загрузить статистику личного кабинета")
+        body = "⚠️ Не удалось загрузить данные. Попробуйте позже."
+    try:
+        if _auth_state.get(telegram_id, {}).get("authenticated"):
+            tg_call("sendMessage", {
+                "chat_id": telegram_id,
+                "text": body,
+                "parse_mode": "HTML",
+                "reply_markup": PRIVATE_KEYBOARD,
+            })
+    finally:
+        with _private_updates_lock:
+            _stats_in_progress.discard((telegram_id, show_tickets))
 
 
 def handle_private_message(message: dict) -> None:
@@ -692,18 +776,22 @@ def handle_private_message(message: dict) -> None:
         tg_call("sendMessage", {"chat_id": telegram_id, "text": "\n".join(lines), "parse_mode": "HTML"})
         return
 
-    if command in ("Личный кабинет", "/stats"):
-        tg_call("sendMessage", {
-            "chat_id": telegram_id,
-            "text": f"👤 <b>{escape(user['name'])}</b>\n\n{format_stats_message(user)}",
-            "parse_mode": "HTML",
-            "reply_markup": PRIVATE_KEYBOARD,
-        })
+    if command in ("Личный кабинет", "/stats", "Мои заявки", "/mytickets"):
+        show_tickets = command in ("Мои заявки", "/mytickets")
+        key = (telegram_id, show_tickets)
+        with _private_updates_lock:
+            if key in _stats_in_progress:
+                return
+            _stats_in_progress.add(key)
+        _stats_executor.submit(send_private_stats, telegram_id, user, show_tickets)
+        return
+
+    if command not in ("Меню", "/menu", "/start", "/login"):
         return
 
     tg_call("sendMessage", {
         "chat_id": telegram_id,
-        "text": "Личный кабинет — статистика заявок\n/agents — список агентов UseDesk\n/logout — выйти",
+        "text": "Личный кабинет — статистика\nМои заявки — список назначенных заявок\n/agents — список агентов UseDesk\n/logout — выйти",
         "reply_markup": PRIVATE_KEYBOARD,
     })
 
@@ -717,6 +805,8 @@ def telegram_webhook():
     update = request.get_json(silent=True) or {}
     message = update.get("message")
     if message:
+        if message.get("chat", {}).get("type") == "private" and is_duplicate_private_update(update.get("update_id")):
+            return jsonify({"ok": True}), 200
         try:
             handle_private_message(message)
         except Exception:
@@ -733,9 +823,37 @@ def telegram_webhook():
     callback_id = callback.get("id")
     data = callback.get("data", "")
     chat_id = callback.get("message", {}).get("chat", {}).get("id")
+    action = re.fullmatch(r"(assign|take|pause|resolve):([0-9]+)|assign_to:([0-9]+):([0-9]+)", data)
+    if not action:
+        return jsonify({"ok": True}), 200
 
-    if data.startswith("assign:"):
-        ticket_id = data.split(":", 1)[1]
+    user = ADMIN_BY_ID.get(callback.get("from", {}).get("id"))
+    if not TELEGRAM_WEBHOOK_SECRET or not user:
+        answer_callback_query(callback_id, "У вас нет доступа к действиям с заявками", show_alert=True)
+        return jsonify({"ok": True}), 200
+
+    operation, ticket_id, assigned_ticket_id, agent_id = action.groups()
+    if operation == "take":
+        agent_id = user.get("usedesk_agent_id")
+        if not agent_id:
+            answer_callback_query(callback_id, "Укажи usedesk_agent_id в ADMIN_USERS", show_alert=True)
+        elif assign_ticket(ticket_id, agent_id):
+            answer_callback_query(callback_id, "Заявка назначена на тебя")
+            sync_ticket_assignee(ticket_id, agent_id)
+        else:
+            answer_callback_query(callback_id, "Не удалось назначить заявку", show_alert=True)
+        return jsonify({"ok": True}), 200
+
+    if operation in TICKET_ACTION_STATUSES:
+        status_id = TICKET_ACTION_STATUSES[operation]
+        if update_ticket(ticket_id, status=status_id):
+            answer_callback_query(callback_id, "Заявка на паузе" if operation == "pause" else "Заявка решена")
+            sync_ticket_status(ticket_id, status_id)
+        else:
+            answer_callback_query(callback_id, "Не удалось изменить статус заявки", show_alert=True)
+        return jsonify({"ok": True}), 200
+
+    if operation == "assign":
         agents = get_agents()
         if not agents:
             answer_callback_query(callback_id, "Не удалось получить список агентов", show_alert=True)
@@ -750,8 +868,8 @@ def telegram_webhook():
         tg_call("sendMessage", {"chat_id": chat_id, "text": f"Кому назначить заявку № {ticket_id}?", "reply_markup": keyboard})
         answer_callback_query(callback_id)
 
-    elif data.startswith("assign_to:"):
-        _, ticket_id, agent_id = data.split(":", 2)
+    else:
+        ticket_id = assigned_ticket_id
         agents = get_agents()
         agent_name = next((a["name"] for a in agents if a["id"] == agent_id), agent_id)
         message_id = callback.get("message", {}).get("message_id")
